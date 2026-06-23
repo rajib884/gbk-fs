@@ -30,21 +30,48 @@ on write.
 
 ## Install
 
-The server is self-contained in a virtualenv.
-
 ```bash
+git clone https://github.com/rajib884/gbk-fs.git
+cd gbk-fs
 python -m venv .venv
-.venv/Scripts/python -m pip install -e .      # Windows
-# source .venv/bin/activate && pip install -e .   # POSIX
+.venv/Scripts/python -m pip install -e .
 ```
 
-Requires Python ≥ 3.10, `mcp`, and `regex` (for `\p{Han}` / `\x{4e00}` Unicode-property
-search). No external `iconv`/`ripgrep` binaries are needed.
+For better encoding auto-detection: `.venv/Scripts/python -m pip install -e .[detect]`
+
+## Register with Claude Code
+
+Use the **venv** Python so the bundled dependencies are on the path.
+
+**Global install (user scope)** — registers the server once for your user, so it's available
+in every project you open:
+
+```bash
+claude mcp add gbk-fs --scope user -- /path/to/gbk-fs/.venv/Scripts/python.exe -m gbk_fs
+```
+
+Scopes: `--scope user` (all your projects), `--scope project` (shared via a committed
+`.mcp.json`), `--scope local` (this project only, the default). Manage with
+`claude mcp list`, `claude mcp get gbk-fs`, `claude mcp remove gbk-fs`.
+
+Or configure it manually in `.mcp.json` (project scope):
+
+```json
+{
+  "mcpServers": {
+    "gbk-fs": {
+      "command": "/path/to/gbk-fs/.venv/Scripts/python.exe",
+      "args": ["-m", "gbk_fs"]
+    }
+  }
+}
+```
+
+You can also pass `--root /path/to/your/repo`, `--config path/to/.gbk-fs.json`, or set `GBK_FS_ROOT` / `GBK_FS_CONFIG`.
 
 ## Configure
 
-Create a `.gbk-fs.json` at your repo root (JSONC: comments and trailing commas allowed). See
-[`.gbk-fs.example.json`](./.gbk-fs.example.json):
+Create a `.gbk-fs.json` at your repo root. See [`.gbk-fs.example.json`](./.gbk-fs.example.json):
 
 ```jsonc
 {
@@ -64,42 +91,6 @@ Create a `.gbk-fs.json` at your repo root (JSONC: comments and trailing commas a
 
 **Encoding precedence:** explicit `encoding` arg → per-glob rule → auto-detect (BOM sniff →
 strict-UTF-8 → `defaultEncoding`).
-
-## Register with Claude Code
-
-Point the server at your real source tree with `--root` (or set `root` in the config). The
-sandbox confines all operations to that tree. Use the **venv** Python so the bundled
-dependencies are on the path.
-
-**Global install (user scope)** — registers the server once for your user, so it's available
-in every project you open:
-
-```bash
-# POSIX
-claude mcp add gbk-fs --scope user -- /path/to/gbk-fs/.venv/bin/python -m gbk_fs --root /path/to/your/repo
-
-# Windows
-claude mcp add gbk-fs --scope user -- C:/path/to/gbk-fs/.venv/Scripts/python.exe -m gbk_fs --root C:/path/to/your/repo
-```
-
-Scopes: `--scope user` (all your projects), `--scope project` (shared via a committed
-`.mcp.json`), `--scope local` (this project only, the default). Manage with
-`claude mcp list`, `claude mcp get gbk-fs`, `claude mcp remove gbk-fs`.
-
-Or configure it manually in `.mcp.json` (project scope):
-
-```json
-{
-  "mcpServers": {
-    "gbk-fs": {
-      "command": "/path/to/gbk-fs/.venv/Scripts/python.exe",
-      "args": ["-m", "gbk_fs", "--root", "/path/to/your/repo"]
-    }
-  }
-}
-```
-
-You can also pass `--config path/to/.gbk-fs.json`, or set `GBK_FS_ROOT` / `GBK_FS_CONFIG`.
 
 ## How edits stay byte-faithful
 
