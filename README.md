@@ -48,7 +48,7 @@ Create a `.gbk-fs.json` at your repo root (JSONC: comments and trailing commas a
 
 ```jsonc
 {
-  "root": "d:/compile/220F_6vPE",   // sandbox boundary; all paths resolve under here
+  "root": "/path/to/your/repo",      // sandbox boundary; all paths resolve under here
   "defaultEncoding": "gbk",          // how existing files are decoded/detected
   "encodeCodec": "gb18030",          // how new content is encoded: gb18030 (default) | gbk
   "encodingRules": [
@@ -68,20 +68,32 @@ strict-UTF-8 → `defaultEncoding`).
 ## Register with Claude Code
 
 Point the server at your real source tree with `--root` (or set `root` in the config). The
-sandbox confines all operations to that tree.
+sandbox confines all operations to that tree. Use the **venv** Python so the bundled
+dependencies are on the path.
+
+**Global install (user scope)** — registers the server once for your user, so it's available
+in every project you open:
 
 ```bash
-claude mcp add gbk-fs -- /path/to/.venv/bin/python -m gbk_fs --root d:/compile/220F_6vPE
+# POSIX
+claude mcp add gbk-fs --scope user -- /path/to/gbk-fs/.venv/bin/python -m gbk_fs --root /path/to/your/repo
+
+# Windows
+claude mcp add gbk-fs --scope user -- C:/path/to/gbk-fs/.venv/Scripts/python.exe -m gbk_fs --root C:/path/to/your/repo
 ```
 
-Or in `.mcp.json`:
+Scopes: `--scope user` (all your projects), `--scope project` (shared via a committed
+`.mcp.json`), `--scope local` (this project only, the default). Manage with
+`claude mcp list`, `claude mcp get gbk-fs`, `claude mcp remove gbk-fs`.
+
+Or configure it manually in `.mcp.json` (project scope):
 
 ```json
 {
   "mcpServers": {
     "gbk-fs": {
-      "command": "d:/MCP/.venv/Scripts/python.exe",
-      "args": ["-m", "gbk_fs", "--root", "d:/compile/220F_6vPE"]
+      "command": "/path/to/gbk-fs/.venv/Scripts/python.exe",
+      "args": ["-m", "gbk_fs", "--root", "/path/to/your/repo"]
     }
   }
 }

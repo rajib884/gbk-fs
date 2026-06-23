@@ -1,6 +1,6 @@
 {
   // Sandbox boundary: every path is resolved (after symlink/.. normalization) under here.
-  "root": "d:/compile/220F_6vPE",
+  "root": "/path/to/your/repo",
 
   // How EXISTING files are decoded/detected when no explicit encoding or rule applies.
   "defaultEncoding": "gbk",
