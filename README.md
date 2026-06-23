@@ -15,8 +15,6 @@ on write.
   never change *and* any Unicode/CJK character can be written. A strict `gbk` mode is
   available and fails loudly on non-GBK characters rather than substituting `?`.
 
-Implements the requirements in [`gbk-fs-mcp-server-requirements.md`](./gbk-fs-mcp-server-requirements.md).
-
 ## Tools
 
 | Tool | Purpose |
@@ -114,7 +112,7 @@ of the file is copied verbatim, so a `git diff` shows only the line you actually
 ## Develop / test
 
 ```bash
-.venv/Scripts/python -m pytest        # 42 tests: encoding, fidelity, search, sandbox, concurrency
+.venv/Scripts/python -m pytest        # 44 tests: encoding, fidelity, search, sandbox, concurrency
 ```
 
 ## License

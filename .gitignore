@@ -24,3 +24,6 @@ Thumbs.db
 
 # Local, non-distributed config (the example is committed instead)
 .gbk-fs.local.json
+
+# Internal spec, kept locally but not published in the repo
+gbk-fs-mcp-server-requirements.md
