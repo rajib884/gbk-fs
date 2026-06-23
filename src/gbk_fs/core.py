@@ -21,6 +21,7 @@ from .errors import (
     InvalidArguments,
     IsBinary,
     NotFound,
+    ReplacementChar,
 )
 from .fileio import atomic_write, file_sha256, looks_binary, read_bytes, sha256_hex
 from .locks import PathLocks
@@ -84,6 +85,25 @@ class GbkFs:
         """cat -n style: right-justified line number, tab, content (parity with native Read)."""
         return "\n".join(f"{i:>6}\t{line}" for i, line in enumerate(lines, start))
 
+    @staticmethod
+    def _guard_replacement_chars(text: str, *, where: str) -> None:
+        """Refuse content carrying U+FFFD (the corruption signature) unless explicitly allowed.
+
+        gb18030 (the default encode codec) encodes U+FFFD happily, so the generic LossyEncode
+        guard never catches it; this dedicated, codec-independent check does (write guard, #1).
+        """
+        positions = enc.replacement_char_positions(text)
+        if positions:
+            raise ReplacementChar(
+                f"{where} contains {len(positions)} U+FFFD replacement character(s) "
+                f"(first at char index {positions[0]}). This usually means the text came from "
+                f"a lossy decode (e.g. a GBK file read as UTF-8); writing it would persist "
+                f"corruption. Fix the source, or pass allow_replacement_chars=true if the "
+                f"character is genuinely intended.",
+                count=len(positions),
+                first_index=positions[0],
+            )
+
     def _detect(self, raw: bytes, rel: str, explicit: str | None) -> enc.Detected:
         return enc.detect_encoding(
             raw,
@@ -107,6 +127,46 @@ class GbkFs:
         return "\n".join(lines)
 
     # ---------------------------------------------------------------- read
+    def _render_text(
+        self,
+        raw: bytes,
+        rel: str,
+        *,
+        encoding: str | None,
+        offset: int | None,
+        limit: int | None,
+    ) -> dict[str, Any]:
+        """Decode ``raw`` (BOM included) into the numbered, line-windowed model view.
+
+        Shared by :meth:`read_file` (disk bytes) and :meth:`read_git` (a git blob): returns
+        ``content`` (cat -n numbered, windowed by offset/limit) plus the encoding/EOL/BOM
+        metadata. Raises IsBinary / DecodeError exactly as a normal read would.
+        """
+        if looks_binary(raw[:8192]):
+            raise IsBinary(f"content appears to be binary (NUL bytes); not decoding: {rel}")
+
+        det = self._detect(raw, rel, encoding)
+        text = enc.decode_body(raw[len(det.bom):], det.decode_codec,
+                               errors=self.config.on_decode_error)
+        eol = enc.detect_eol(text) or self.config.default_eol
+        view = enc.normalize_to_lf(text)
+        all_lines = self._split_lines(view)
+        line_count = len(all_lines)
+
+        start = max(1, offset or 1)
+        end = line_count if limit is None else min(line_count, start - 1 + max(0, limit))
+        selected = all_lines[start - 1 : end] if start <= line_count else []
+        return {
+            "content": self._number(selected, start),
+            "detected_encoding": det.logical,
+            "eol": eol,
+            "has_bom": det.has_bom,
+            "final_newline": enc.has_final_newline(text),
+            "line_count": line_count,
+            "start_line": start if selected else 0,
+            "end_line": start - 1 + len(selected),
+        }
+
     def read_file(
         self,
         path: str,
@@ -122,38 +182,54 @@ class GbkFs:
             raise InvalidArguments(f"path is a directory, not a file: {rel}")
 
         raw, truncated = read_bytes(real, limit=self.config.max_read_bytes)
-        if looks_binary(raw[:8192]):
-            raise IsBinary(f"file appears to be binary (NUL bytes); not decoding: {rel}")
-
-        det = self._detect(raw, rel, encoding)
-        body = raw[len(det.bom):]
-        text = enc.decode_body(body, det.decode_codec, errors=self.config.on_decode_error)
-        eol = enc.detect_eol(text) or self.config.default_eol
-        final_nl = enc.has_final_newline(text)
-        view = enc.normalize_to_lf(text)
-        all_lines = self._split_lines(view)
-        line_count = len(all_lines)
-
-        start = max(1, offset or 1)
-        end = line_count if limit is None else min(line_count, start - 1 + max(0, limit))
-        selected = all_lines[start - 1 : end] if start <= line_count else []
-        numbered = self._number(selected, start)
+        rendered = self._render_text(raw, rel, encoding=encoding, offset=offset, limit=limit)
 
         self._mark_read(real)
         return {
             "path": rel,
             "abs": str(real),
-            "content": numbered,
-            "detected_encoding": det.logical,
-            "eol": eol,
-            "has_bom": det.has_bom,
-            "final_newline": final_nl,
-            "line_count": line_count,
-            "start_line": start if selected else 0,
-            "end_line": start - 1 + len(selected),
+            **rendered,
             "truncated": truncated,
             "sha256": file_sha256(real),
             "mtime_ns": real.stat().st_mtime_ns,
+        }
+
+    def read_git(
+        self,
+        path: str,
+        ref: str = "HEAD",
+        *,
+        offset: int | None = None,
+        limit: int | None = None,
+        encoding: str | None = None,
+    ) -> dict[str, Any]:
+        """Read a file's bytes from a git ref (HEAD, a SHA, a branch, or :0:/index) and decode
+        them through the same pipeline as :meth:`read_file`.
+
+        The recovery primitive (#2): when the working tree is corrupt, the clean source is
+        git. Deliberately does **not** mark the path read-in-session — a blob is not the
+        current disk state, so it must not satisfy the unread-overwrite guard (FR8). Reports
+        the blob's content ``sha256`` and a null ``mtime_ns`` (a blob has no mtime).
+        """
+        from . import git as gitmod
+
+        real, rel = self._resolve(path)  # sandbox + deny check; file need not exist on disk
+        if real.exists() and real.is_dir():
+            raise InvalidArguments(f"path is a directory, not a file: {rel}")
+
+        blob = gitmod.git_blob_bytes(self.config.root, rel, ref)
+        truncated = len(blob) > self.config.max_read_bytes
+        raw = blob[: self.config.max_read_bytes] if truncated else blob
+        rendered = self._render_text(raw, rel, encoding=encoding, offset=offset, limit=limit)
+
+        return {
+            "path": rel,
+            "ref": ref,
+            "source": f"git:{ref}",
+            **rendered,
+            "truncated": truncated,
+            "sha256": sha256_hex(blob),
+            "mtime_ns": None,
         }
 
     def read_files(self, items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -192,10 +268,13 @@ class GbkFs:
         allow_overwrite_unread: bool = False,
         expected_hash: str | None = None,
         expected_mtime: int | None = None,
+        allow_replacement_chars: bool = False,
     ) -> dict[str, Any]:
         real, rel = self._resolve(path)
         if real.exists() and real.is_dir():
             raise InvalidArguments(f"path is a directory: {rel}")
+        if not allow_replacement_chars:
+            self._guard_replacement_chars(content, where=f"write content for {rel!r}")
         exists = real.exists()
 
         if exists and not self._is_read(real) and not allow_overwrite_unread:
@@ -274,6 +353,7 @@ class GbkFs:
         replace_all: bool = False,
         expected_hash: str | None = None,
         expected_mtime: int | None = None,
+        allow_replacement_chars: bool = False,
     ) -> dict[str, Any]:
         real, rel = self._resolve(path)
         if not real.exists():
@@ -290,7 +370,8 @@ class GbkFs:
 
             data, result, logical, eol = self._stage_file(
                 raw, rel, [{"old_string": old_string, "new_string": new_string,
-                            "replace_all": replace_all}]
+                            "replace_all": replace_all,
+                            "allow_replacement_chars": allow_replacement_chars}]
             )
             atomic_write(real, data)
             self._mark_read(real)
@@ -325,6 +406,8 @@ class GbkFs:
 
         results: list[tuple[dict, enc.ReplaceResult]] = []
         for e in file_edits:
+            if not e.get("allow_replacement_chars"):
+                self._guard_replacement_chars(e["new_string"], where=f"new_string for {rel!r}")
             res = enc.replace_in_body(
                 body,
                 decode_codec=det.decode_codec,
@@ -364,6 +447,7 @@ class GbkFs:
                     replace_all=bool(e.get("replace_all", False)),
                     expected_hash=e.get("expected_hash"),
                     expected_mtime=e.get("expected_mtime"),
+                    allow_replacement_chars=bool(e.get("allow_replacement_chars", False)),
                 )
                 results.append({"index": i, "path": r["path"], "ok": True,
                                 "replacements": r["replacements"]})

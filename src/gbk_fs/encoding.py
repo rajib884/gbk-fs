@@ -243,6 +243,24 @@ def char_byte_starts(body: bytes, decode_codec: str) -> tuple[str, list[int]]:
 
 
 # --------------------------------------------------------------------------------------
+# Corruption guard helper (write-time replacement-character check, #1)
+# --------------------------------------------------------------------------------------
+
+#: U+FFFD. Appears in text when bytes were decoded lossily upstream (the incident's
+#: corruption signature). Distinct from any encode failure: gb18030 encodes it happily.
+REPLACEMENT_CHAR = "�"
+
+
+def replacement_char_positions(text: str) -> list[int]:
+    """Character indices of every U+FFFD in ``text`` (empty list if clean).
+
+    The write guard uses this to refuse persisting content that carries the replacement
+    character, and to report the first offset + total count so the failure is actionable.
+    """
+    return [i for i, ch in enumerate(text) if ch == REPLACEMENT_CHAR]
+
+
+# --------------------------------------------------------------------------------------
 # Encode with a loud lossy guard
 # --------------------------------------------------------------------------------------
 

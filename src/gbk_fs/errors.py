@@ -112,3 +112,29 @@ class UnreadOverwrite(GbkFsError):
     """Refusing to overwrite an existing file not read in this session (FR8)."""
 
     code = "UNREAD_OVERWRITE"
+
+
+class ReplacementChar(GbkFsError):
+    """Incoming write/edit content contains U+FFFD, the Unicode replacement character.
+
+    This is the corruption signature this server guards against: U+FFFD almost always means
+    the content was produced by a lossy decode upstream (e.g. a GBK file read as UTF-8), so
+    persisting it would write corruption to disk. Note the default ``gb18030`` codec *can*
+    encode U+FFFD (to bytes ``84 31 a4 37``), so the generic LossyEncode guard never catches
+    it — this is a dedicated, codec-independent check (write guard, #1). We refuse by default;
+    pass ``allow_replacement_chars=true`` if the character is genuinely intended.
+    """
+
+    code = "REPLACEMENT_CHAR"
+
+    def __init__(self, message: str, *, count: int, first_index: int):
+        super().__init__(message)
+        self.count = count
+        self.first_index = first_index
+
+
+class GitError(GbkFsError):
+    """A git invocation failed: not a repository, unknown ref, path absent in the ref, or
+    the ``git`` executable is unavailable (read_git, #2)."""
+
+    code = "GIT_ERROR"

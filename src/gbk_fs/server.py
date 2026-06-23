@@ -46,6 +46,17 @@ def _format_read(res: dict[str, Any]) -> str:
     return f"{body}\n\n{_meta_line(res)}"
 
 
+def _format_read_git(res: dict[str, Any]) -> str:
+    body = res["content"] if res["content"] else "(empty selection)"
+    bom = "yes" if res.get("has_bom") else "no"
+    trunc = " truncated=yes" if res.get("truncated") else ""
+    meta = (
+        f"[gbk-fs git:{res['ref']}] {res['path']} | encoding={res['detected_encoding']} "
+        f"eol={res['eol']} bom={bom} lines={res['line_count']}{trunc} sha256={res['sha256']}"
+    )
+    return f"{body}\n\n{meta}"
+
+
 def _format_read_files(res: dict[str, Any]) -> str:
     chunks: list[str] = []
     for r in res["results"]:
@@ -161,6 +172,31 @@ def build_server(core: GbkFs) -> FastMCP:
             raise _err(e)
 
     @mcp.tool()
+    def read_git(
+        path: Annotated[str, Field(description="Absolute or repo-relative path")],
+        ref: Annotated[
+            str,
+            Field(description="Git ref: HEAD, a commit SHA, a branch, HEAD~2, or ':0:' / "
+                              "'index' for the staged (index) version"),
+        ] = "HEAD",
+        offset: Annotated[int | None, Field(description="1-based first line to return")] = None,
+        limit: Annotated[int | None, Field(description="Max number of lines to return")] = None,
+        encoding: Annotated[str | None, Field(description="Override detected encoding")] = None,
+    ) -> str:
+        """Read a file from a git ref (HEAD/SHA/branch/index), decoding GBK transparently.
+
+        For recovering a corrupted working file from its clean committed or staged bytes.
+        Does NOT mark the working file read, so it won't satisfy write_file's
+        unread-overwrite guard.
+        """
+        try:
+            return _format_read_git(
+                core.read_git(path, ref, offset=offset, limit=limit, encoding=encoding)
+            )
+        except GbkFsError as e:
+            raise _err(e)
+
+    @mcp.tool()
     def write_file(
         path: Annotated[str, Field(description="Absolute or repo-relative path")],
         content: Annotated[str, Field(description="Full UTF-8 content to write")],
@@ -172,12 +208,17 @@ def build_server(core: GbkFs) -> FastMCP:
         expected_hash: Annotated[
             str | None, Field(description="sha256 from a prior read; rejects if file changed")
         ] = None,
+        allow_replacement_chars: Annotated[
+            bool, Field(description="Permit writing U+FFFD (replacement char); refused by "
+                                    "default as it signals upstream corruption")
+        ] = False,
     ) -> str:
         """Create or overwrite a file, encoding to the target on-disk encoding (GBK/GB18030)."""
         try:
             r = core.write_file(
                 path, content, encoding=encoding, eol=eol,
                 allow_overwrite_unread=allow_overwrite_unread, expected_hash=expected_hash,
+                allow_replacement_chars=allow_replacement_chars,
             )
             verb = "Created" if r["created"] else "Wrote"
             return (
@@ -196,11 +237,16 @@ def build_server(core: GbkFs) -> FastMCP:
         expected_hash: Annotated[
             str | None, Field(description="sha256 from a prior read; rejects if file changed")
         ] = None,
+        allow_replacement_chars: Annotated[
+            bool, Field(description="Permit U+FFFD (replacement char) in new_string; refused "
+                                    "by default as it signals upstream corruption")
+        ] = False,
     ) -> str:
         """Edit a file by exact match; untouched bytes stay byte-identical (no encoding churn)."""
         try:
             r = core.edit_file(
                 path, old_string, new_string, replace_all=replace_all, expected_hash=expected_hash,
+                allow_replacement_chars=allow_replacement_chars,
             )
             head = (
                 f"Edited {r['path']}: {r['replacements']} replacement(s), encoding={r['encoding']}, "
@@ -215,7 +261,8 @@ def build_server(core: GbkFs) -> FastMCP:
         edits: Annotated[
             list[dict[str, Any]],
             Field(description="List of {path, old_string, new_string, replace_all?, "
-                              "expected_hash?}. Same-file edits apply in order."),
+                              "expected_hash?, allow_replacement_chars?}. Same-file edits "
+                              "apply in order."),
         ],
         atomic: Annotated[
             bool, Field(description="All-or-nothing: validate all, then commit, else roll back")
