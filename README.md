@@ -26,7 +26,7 @@ Implements the requirements in [`gbk-fs-mcp-server-requirements.md`](./gbk-fs-mc
 | `write_file` | Create/overwrite; encodes to target; refuses to clobber an unread file (FR8) |
 | `edit_file` | Exact-match replace with byte-faithful splicing; returns a unified diff |
 | `apply_edits` | Many edits across files in one call; transactional (`atomic=true`) with rollback |
-| `search_content` | ripgrep-class regex search; decodes per-file before matching; UTF-8 out |
+| `search_content` | ripgrep-class regex search; decodes per-file before matching; UTF-8 out. Supports Unicode properties (`\p{Han}`), brace-hex (`\x{4e00}`) and explicit ranges (`[一-鿿]`) |
 | `list_files` | Glob listing (`**`, `{a,b}` supported), optional size/mtime/encoding |
 | `stat_file` | Metadata only (encoding, eol, bom, size, line_count, is_binary) |
 
@@ -40,7 +40,8 @@ python -m venv .venv
 # source .venv/bin/activate && pip install -e .   # POSIX
 ```
 
-Requires Python ≥ 3.10 and `mcp`. No external `iconv`/`ripgrep` binaries are needed.
+Requires Python ≥ 3.10, `mcp`, and `regex` (for `\p{Han}` / `\x{4e00}` Unicode-property
+search). No external `iconv`/`ripgrep` binaries are needed.
 
 ## Configure
 

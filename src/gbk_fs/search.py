@@ -15,6 +15,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+try:  # optional engine: enables \p{...} Unicode properties (ripgrep/PCRE parity)
+    import regex as _regex_mod
+except ImportError:  # pragma: no cover
+    _regex_mod = None
+
 from . import encoding as enc
 from .errors import DecodeError, GbkFsError, InvalidArguments
 from .fileio import looks_binary, read_bytes
@@ -34,6 +39,43 @@ TYPE_GLOBS: dict[str, list[str]] = {
     "yaml": ["*.yml", "*.yaml"],
     "toml": ["*.toml"],
 }
+
+# PCRE/ripgrep \x{4e00} brace-hex escapes -> Python \uXXXX / \U00XXXXXX.
+_HEX_BRACE = re.compile(r"\\x\{([0-9A-Fa-f]+)\}")
+
+
+def _translate_hex_braces(pattern: str) -> str:
+    def repl(m: re.Match[str]) -> str:
+        cp = int(m.group(1), 16)
+        return f"\\u{cp:04X}" if cp <= 0xFFFF else f"\\U{cp:08X}"
+
+    return _HEX_BRACE.sub(repl, pattern)
+
+
+def _compile_pattern(pats: list[str], *, ignore_case: bool, multiline: bool):
+    """Compile the OR-combined regex, accepting ripgrep-style \\x{..} and \\p{..} escapes.
+
+    \\x{HEX} is translated to a Python escape (no dependency). \\p{Name} Unicode properties
+    need the ``regex`` engine; if it's unavailable we fail with an actionable message rather
+    than emitting a confusing ``re`` error.
+    """
+    combined = _translate_hex_braces("|".join(f"(?:{p})" for p in pats))
+    uses_props = "\\p{" in combined or "\\P{" in combined
+    engine = _regex_mod if _regex_mod is not None else re
+    if uses_props and _regex_mod is None:  # pragma: no cover - only without the regex extra
+        raise InvalidArguments(
+            "pattern uses \\p{...} Unicode properties, which need the 'regex' package "
+            "(pip install regex). Or use an explicit character class, e.g. [一-鿿]."
+        )
+    flags = 0
+    if ignore_case:
+        flags |= engine.IGNORECASE
+    if multiline:
+        flags |= engine.DOTALL | engine.MULTILINE
+    try:
+        return engine.compile(combined, flags)
+    except Exception as exc:  # re.error / regex.error
+        raise InvalidArguments(f"invalid regex: {exc}")
 
 
 def _gather_files(core, base: Path, glob: str | None, ftype: str | None) -> list[Path]:
@@ -139,16 +181,7 @@ def search_content(
     if output_mode not in ("content", "files", "count"):
         raise InvalidArguments("output_mode must be 'content', 'files' or 'count'")
 
-    combined = "|".join(f"(?:{p})" for p in pats)
-    flags = 0
-    if ignore_case:
-        flags |= re.IGNORECASE
-    if multiline:
-        flags |= re.DOTALL | re.MULTILINE
-    try:
-        regex = re.compile(combined, flags)
-    except re.error as exc:
-        raise InvalidArguments(f"invalid regex: {exc}")
+    matcher = _compile_pattern(pats, ignore_case=ignore_case, multiline=multiline)
 
     if context:
         before = after = context
@@ -178,7 +211,7 @@ def search_content(
             return None
         view = enc.normalize_to_lf(text)
         lines = core._split_lines(view)
-        matched, total = _matched_line_numbers(view, lines, regex, multiline)
+        matched, total = _matched_line_numbers(view, lines, matcher, multiline)
         if not matched:
             return None
         return {"path": rel, "encoding": det.logical, "lines": lines,

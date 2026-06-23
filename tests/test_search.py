@@ -67,3 +67,27 @@ def test_search_multiple_patterns_or(fs, root):
     res = fs.search_content(patterns=["路由信息", "结束"], path="sys/rtv6/nsm_vrf_sync.c",
                             output_mode="count")
     assert res["total_matches"] == 2  # two distinct lines match
+
+
+def test_search_cjk_regex_syntaxes_all_match(fs, root):
+    """ripgrep-style CJK patterns: \\p{Han}, \\x{HEX}, and explicit ranges all work (parity)."""
+    _seed(root)
+    target = "sys/rtv6/nsm_vrf_sync.c"
+    # \x{4e00}-\x{9fff} brace-hex range (translated to Python escapes)
+    r_hex = fs.search_content(pattern=r"[\x{4e00}-\x{9fff}]+", path=target, output_mode="count")
+    # explicit char-class range (the user's known-working workaround)
+    r_range = fs.search_content(pattern="[一-鿿]+", path=target, output_mode="count")
+    # \p{Han} Unicode property (needs the regex engine)
+    r_prop = fs.search_content(pattern=r"\p{Han}+", path=target, output_mode="count")
+
+    assert r_hex["total_matches"] > 0
+    assert r_hex["total_matches"] == r_range["total_matches"] == r_prop["total_matches"]
+
+
+def test_search_invalid_regex_reported_cleanly(fs, root):
+    import pytest
+    from gbk_fs.errors import InvalidArguments
+
+    _seed(root)
+    with pytest.raises(InvalidArguments):
+        fs.search_content(pattern="(unterminated", output_mode="count")

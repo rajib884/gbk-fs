@@ -12,6 +12,8 @@ license = { text = "MIT" }
 authors = [{ name = "gbk-fs" }]
 dependencies = [
     "mcp>=1.2",
+    # Unicode-property regex (\p{Han}, \x{4e00}) for ripgrep-class CJK search.
+    "regex>=2023.0.0",
 ]
 
 [project.optional-dependencies]
