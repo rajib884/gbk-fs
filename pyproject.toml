@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gbk-fs-mcp"
+version = "0.1.0"
+description = "Encoding-aware filesystem MCP server (GBK/GB18030 <-> UTF-8) for Claude Code"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gbk-fs" }]
+dependencies = [
+    "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+# Optional: improves auto-detection of unknown encodings. The server works without it.
+detect = ["charset-normalizer>=3"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+gbk-fs-mcp = "gbk_fs.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

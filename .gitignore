@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual env
+.venv/
+venv/
+
+# Test / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local, non-distributed config (the example is committed instead)
+.gbk-fs.local.json

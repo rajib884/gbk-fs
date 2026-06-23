@@ -1,0 +1,35 @@
+{
+  // Sandbox boundary: every path is resolved (after symlink/.. normalization) under here.
+  "root": "d:/compile/220F_6vPE",
+
+  // How EXISTING files are decoded/detected when no explicit encoding or rule applies.
+  "defaultEncoding": "gbk",
+
+  // How NEW content is ENCODED on write:
+  //   "gb18030" (default) — strict superset of GBK; byte-identical to GBK for GBK chars,
+  //                         and lets you author ANY CJK/Unicode character losslessly.
+  //   "gbk"               — strict GBK; authoring a non-GBK char fails loudly (lossy guard).
+  "encodeCodec": "gb18030",
+
+  // Per-glob encoding rules (win over auto-detect; an explicit `encoding` arg wins over these).
+  "encodingRules": [
+    { "glob": "**/*.{c,h,cpp,cc,cxx,hpp,inc}", "encoding": "gbk" },
+    { "glob": "**/*.{md,json,txt,py,yml,yaml,toml}", "encoding": "utf-8" }
+  ],
+
+  // New files get this EOL; existing files keep their own.
+  "defaultEol": "crlf",
+
+  // Decode behaviour for invalid byte sequences: "strict" (surface problems) | "replace".
+  "onDecodeError": "strict",
+
+  // Guard rail so huge libs/docs aren't slurped into a read.
+  "maxReadBytes": 5000000,
+
+  // Never decode/return these (and never descend into .git).
+  "denyGlobs": [
+    "**/*.a", "**/*.o", "**/*.so", "**/*.lib", "**/*.exe", "**/*.dll",
+    "**/*.doc", "**/*.docx", "**/*.pdf", "**/*.zip",
+    "**/.git/**"
+  ]
+}
