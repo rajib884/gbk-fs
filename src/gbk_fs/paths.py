@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .errors import InvalidArguments, OutsideRoot
 
@@ -21,6 +21,18 @@ from .errors import InvalidArguments, OutsideRoot
 def _normalize_input(path: str) -> str:
     """Accept Windows (``d:\\x``) or POSIX (``d:/x``) separators (FR7)."""
     return path.replace("\\", "/")
+
+
+def _foreign_absolute(raw: str) -> bool:
+    """True if ``raw`` is absolute under an OS convention other than the host's.
+
+    ``Path.is_absolute()`` only understands the host flavour, so on POSIX a Windows drive or
+    UNC path (``C:/...``, ``//host/share``) reads as a harmless relative name and would be
+    joined under the root. Checking both pure flavours catches it so the sandbox can reject a
+    drive/UNC path that can never live inside a POSIX root (and vice-versa). Only consulted
+    when the host flavour already reported the path as non-absolute.
+    """
+    return PurePosixPath(raw).is_absolute() or PureWindowsPath(raw).is_absolute()
 
 
 def resolve_in_root(root: Path, path: str) -> Path:
@@ -34,6 +46,11 @@ def resolve_in_root(root: Path, path: str) -> Path:
     raw = _normalize_input(path)
     p = Path(raw)
     if not p.is_absolute():
+        if _foreign_absolute(raw):
+            raise OutsideRoot(
+                f"path {path!r} is an absolute path outside the sandbox root "
+                f"{Path(os.path.realpath(root))}"
+            )
         p = root / raw
 
     # realpath resolves symlinks and `..`; strict=False so non-existent targets still resolve.

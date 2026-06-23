@@ -2,8 +2,9 @@
 
 ``server.py`` is a thin FastMCP wrapper over these methods; tests drive this class directly.
 Each method returns plain data (dicts / lists) and raises :class:`GbkFsError` subclasses on
-failure. No cross-call content cache is kept (NFR7/CR8) — only a per-session set of "files
-read in this session" (for the Write safety check, FR8) and per-path locks.
+failure. No cross-call content cache is kept (NFR7/CR8) — only a per-session map of path ->
+last-known content hash (for the Write safety check, FR8, and automatic freshness detection)
+and per-path locks.
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ class GbkFs:
     def __init__(self, config: Config):
         self.config = config
         self.locks = PathLocks()
-        self._read_in_session: set[str] = set()
+        # path key -> sha256 hex of the bytes this session last read/wrote (FR8). A 64-char
+        # digest, not content, so the no-content-cache invariant (NFR7/CR8) still holds.
+        self._known_hash: dict[str, str] = {}
 
     # ---------------------------------------------------------------- helpers
     def _resolve(self, path: str) -> tuple[Path, str]:
@@ -51,11 +54,18 @@ class GbkFs:
     def _key(real: Path) -> str:
         return os.path.normcase(os.path.realpath(real))
 
-    def _mark_read(self, real: Path) -> None:
-        self._read_in_session.add(self._key(real))
+    def _mark_read(self, real: Path, content_hash: str) -> None:
+        self._known_hash[self._key(real)] = content_hash
 
     def _is_read(self, real: Path) -> bool:
-        return self._key(real) in self._read_in_session
+        return self._key(real) in self._known_hash
+
+    def _baseline_hash(self, real: Path, expected_hash: str | None) -> str | None:
+        """Effective hash to verify against: an explicit snapshot wins; otherwise fall back to
+        the hash this session last saw for the path (None if the path was never touched)."""
+        if expected_hash is not None:
+            return expected_hash
+        return self._known_hash.get(self._key(real))
 
     def _check_conflict(
         self, raw: bytes, real: Path, expected_hash: str | None, expected_mtime: int | None
@@ -184,13 +194,14 @@ class GbkFs:
         raw, truncated = read_bytes(real, limit=self.config.max_read_bytes)
         rendered = self._render_text(raw, rel, encoding=encoding, offset=offset, limit=limit)
 
-        self._mark_read(real)
+        digest = file_sha256(real)
+        self._mark_read(real, digest)
         return {
             "path": rel,
             "abs": str(real),
             **rendered,
             "truncated": truncated,
-            "sha256": file_sha256(real),
+            "sha256": digest,
             "mtime_ns": real.stat().st_mtime_ns,
         }
 
@@ -287,8 +298,10 @@ class GbkFs:
 
         with self.locks.hold(real):
             old_raw = real.read_bytes() if exists else b""
-            if exists and (expected_hash is not None or expected_mtime is not None):
-                self._check_conflict(old_raw, real, expected_hash, expected_mtime)
+            if exists:
+                baseline = self._baseline_hash(real, expected_hash)
+                if baseline is not None or expected_mtime is not None:
+                    self._check_conflict(old_raw, real, baseline, expected_mtime)
 
             # Resolve target logical encoding.
             if encoding:
@@ -316,7 +329,8 @@ class GbkFs:
             data = bom + encoded
 
             written = atomic_write(real, data)
-            self._mark_read(real)
+            digest = sha256_hex(data)
+            self._mark_read(real, digest)
 
         return {
             "path": rel,
@@ -325,7 +339,7 @@ class GbkFs:
             "eol": target_eol,
             "has_bom": bool(bom),
             "created": not exists,
-            "sha256": sha256_hex(data),
+            "sha256": digest,
             "mtime_ns": real.stat().st_mtime_ns,
         }
 
@@ -365,8 +379,9 @@ class GbkFs:
 
         with self.locks.hold(real):
             raw = real.read_bytes()
-            if expected_hash is not None or expected_mtime is not None:
-                self._check_conflict(raw, real, expected_hash, expected_mtime)
+            baseline = self._baseline_hash(real, expected_hash)
+            if baseline is not None or expected_mtime is not None:
+                self._check_conflict(raw, real, baseline, expected_mtime)
 
             data, result, logical, eol = self._stage_file(
                 raw, rel, [{"old_string": old_string, "new_string": new_string,
@@ -374,7 +389,8 @@ class GbkFs:
                             "allow_replacement_chars": allow_replacement_chars}]
             )
             atomic_write(real, data)
-            self._mark_read(real)
+            digest = sha256_hex(data)
+            self._mark_read(real, digest)
 
         rr = result[0][1]  # ReplaceResult of the single edit
         return {
@@ -383,7 +399,7 @@ class GbkFs:
             "encoding": logical,
             "eol": eol,
             "bytes_written": len(data),
-            "sha256": sha256_hex(data),
+            "sha256": digest,
             "mtime_ns": real.stat().st_mtime_ns,
             "diff": self._unified_diff(rel, rr.old_view_lf, rr.new_view_lf),
         }
@@ -489,9 +505,11 @@ class GbkFs:
                 raw = real.read_bytes()
                 originals[key] = raw
 
-                # optimistic concurrency: any provided snapshot must match the original (CR5)
+                # optimistic concurrency: an explicit snapshot or the session's last-known
+                # hash must match the original (CR5); explicit wins, per edit.
                 for idx, e in groups[key]:
-                    self._check_conflict(raw, real, e.get("expected_hash"), e.get("expected_mtime"))
+                    baseline = self._baseline_hash(real, e.get("expected_hash"))
+                    self._check_conflict(raw, real, baseline, e.get("expected_mtime"))
 
                 file_edits = [e for _idx, e in groups[key]]
                 data, results, _logical, _eol = self._stage_file(raw, rel, file_edits)
@@ -507,7 +525,6 @@ class GbkFs:
                     real = reals[key]
                     atomic_write(real, staged[key])
                     committed.append((real, originals[key]))
-                    self._mark_read(real)
             except BaseException:
                 for real, orig in reversed(committed):
                     try:
@@ -515,6 +532,11 @@ class GbkFs:
                     except OSError:
                         pass
                 raise
+
+            # Update baselines only after the whole batch commits, so a rollback leaves
+            # _known_hash matching the restored on-disk bytes.
+            for key in order:
+                self._mark_read(reals[key], sha256_hex(staged[key]))
 
         results_list = [per_edit[i] for i in sorted(per_edit)]
         return {"ok": True, "atomic": True, "files": len(order), "results": results_list}

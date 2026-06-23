@@ -132,3 +132,79 @@ def test_nonatomic_reports_per_edit_status(fs, root):
     assert res["ok"] is False
     assert res["results"][0]["ok"] is True
     assert res["results"][1]["ok"] is False and res["results"][1]["code"] == "MATCH_NOT_FOUND"
+
+
+# ---- automatic write-freshness: implicit baseline (no expected_hash needed) -------------
+
+
+def test_implicit_conflict_write_on_external_change(fs, root):
+    """A read establishes a baseline; a later plain write (no expected_hash) must refuse when
+    the file changed on disk in between, instead of silently clobbering it."""
+    write_gbk_c(root / "x.c")
+    fs.read_file("x.c")
+    # something changes the file underneath us
+    (root / "x.c").write_bytes("// 改动\r\nint changed;\r\n".encode("gbk"))
+    before = (root / "x.c").read_bytes()
+    with pytest.raises(Conflict):
+        fs.write_file("x.c", "// 覆盖\n")  # no expected_hash
+    assert (root / "x.c").read_bytes() == before  # untouched
+
+
+def test_implicit_conflict_edit_on_external_change(fs, root):
+    write_gbk_c(root / "x.c")
+    fs.read_file("x.c")
+    (root / "x.c").write_bytes("// 改动\r\nreturn 0;\r\n".encode("gbk"))
+    before = (root / "x.c").read_bytes()
+    with pytest.raises(Conflict):
+        fs.edit_file("x.c", "return 0;", "return 9;")  # no expected_hash
+    assert (root / "x.c").read_bytes() == before
+
+
+def test_no_conflict_when_unchanged(fs, root):
+    """Control: read then edit then write with no external change all succeed; each successful
+    write advances the baseline."""
+    write_gbk_c(root / "x.c")
+    fs.read_file("x.c")
+    fs.edit_file("x.c", "return 0;", "return 1;")  # baseline matches -> ok, baseline advances
+    fs.write_file("x.c", "// 全新内容\n")            # disk == edited bytes -> ok
+    assert "全新内容" in (root / "x.c").read_bytes().decode("gb18030")
+
+
+def test_explicit_hash_overrides_stale_baseline(fs, root):
+    """An explicit expected_hash for the current disk content wins over the stale stored one."""
+    import hashlib
+
+    write_gbk_c(root / "x.c")
+    fs.read_file("x.c")  # stores stale baseline h0
+    new_raw = "// 改动\r\nint y;\r\n".encode("gbk")
+    (root / "x.c").write_bytes(new_raw)
+    current = hashlib.sha256(new_raw).hexdigest()
+    # caller asserts the real current state -> allowed despite the stale stored hash
+    fs.write_file("x.c", "// 覆盖\n", expected_hash=current)
+    assert "覆盖" in (root / "x.c").read_bytes().decode("gb18030")
+
+
+def test_baseline_advances_after_write(fs, root):
+    """Sequential plain writes succeed because each write refreshes the stored baseline."""
+    fs.write_file("new.c", "// 一\nint a;\n")   # create: baseline = content A
+    fs.write_file("new.c", "// 二\nint b;\n")   # disk == A -> ok, baseline = B
+    fs.write_file("new.c", "// 三\nint c;\n")   # disk == B -> ok
+    assert "三" in (root / "new.c").read_bytes().decode("gb18030")
+
+
+def test_atomic_batch_honors_implicit_baseline(fs, root):
+    """A stale baseline on one file aborts the whole atomic batch and rolls back."""
+    a = write_gbk_c(root / "a.c")
+    write_gbk_c(root / "b.c")
+    fs.read_file("a.c"); fs.read_file("b.c")
+    # b.c changes on disk after we read it (still contains "return 0;" so it would match)
+    (root / "b.c").write_bytes("// 改动\r\nreturn 0;\r\n".encode("gbk"))
+    b_changed = (root / "b.c").read_bytes()
+    edits = [
+        {"path": "a.c", "old_string": "return 0;", "new_string": "return 1;"},
+        {"path": "b.c", "old_string": "return 0;", "new_string": "return 2;"},  # stale baseline
+    ]
+    with pytest.raises(Conflict):
+        fs.apply_edits(edits, atomic=True)
+    assert (root / "a.c").read_bytes() == a          # never written
+    assert (root / "b.c").read_bytes() == b_changed  # untouched
