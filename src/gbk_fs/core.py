@@ -404,6 +404,148 @@ class GbkFs:
             "diff": self._unified_diff(rel, rr.old_view_lf, rr.new_view_lf),
         }
 
+    # ------------------------------------------------------------ line-addressed edits
+    def replace_lines(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        new_string: str | None = None,
+        *,
+        edits: list[dict[str, Any]] | None = None,
+        expected_hash: str | None = None,
+        expected_mtime: int | None = None,
+        allow_replacement_chars: bool = False,
+    ) -> dict[str, Any]:
+        """Edit a file by 1-based line number instead of by exact-match text.
+
+        Each edit is an inclusive range ``start_line..end_line`` plus ``new_string``:
+
+        * **replace** — ``end_line >= start_line``, non-empty ``new_string``.
+        * **delete**  — ``end_line >= start_line``, empty ``new_string`` (lines + terminators go).
+        * **insert before ``start_line``** — zero-width range ``end_line = start_line - 1`` (use
+          ``start_line = line_count + 1`` to append at EOF).
+
+        Pass a single edit positionally, or several via ``edits`` (a list of
+        ``{start_line, end_line, new_string}``). In a batch every line number addresses the
+        **original** file and the whole set is applied in one atomic write — so non-contiguous
+        edits need no manual bottom-to-top ordering. Edits in a batch must not overlap. Bytes
+        outside the edited spans stay byte-identical (same splice as :meth:`edit_file`).
+        """
+        if edits is not None:
+            if start_line is not None or end_line is not None or new_string is not None:
+                raise InvalidArguments(
+                    "pass either the positional start_line/end_line/new_string or edits, not both"
+                )
+            normalized = self._normalize_line_edits(edits)
+        else:
+            if start_line is None or end_line is None or new_string is None:
+                raise InvalidArguments(
+                    "replace_lines needs start_line, end_line and new_string (or an edits list)"
+                )
+            normalized = [self._normalize_line_edit(start_line, end_line, new_string, where="")]
+        return self._edit_lines(
+            path, normalized, expected_hash=expected_hash, expected_mtime=expected_mtime,
+            allow_replacement_chars=allow_replacement_chars,
+        )
+
+    @staticmethod
+    def _as_int(value: Any, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise InvalidArguments(f"{name} must be an integer, got {value!r}")
+        return value
+
+    def _normalize_line_edit(
+        self, start_line: Any, end_line: Any, new_string: Any, *, where: str
+    ) -> tuple[int, int, str]:
+        """Validate one edit and return ``(start_line, count, new_string)``.
+
+        ``count = end_line - start_line + 1``: ``>= 1`` replaces/deletes the range, ``0`` inserts
+        before ``start_line``. ``end_line < start_line - 1`` is rejected (a range narrower than
+        empty is meaningless).
+        """
+        s = self._as_int(start_line, f"{where}start_line")
+        e = self._as_int(end_line, f"{where}end_line")
+        if not isinstance(new_string, str):
+            raise InvalidArguments(f"{where}new_string must be a string")
+        if s < 1:
+            raise InvalidArguments(f"{where}start_line must be >= 1 (got {s})")
+        if e < s - 1:
+            raise InvalidArguments(
+                f"{where}end_line {e} is below start_line-1 ({s - 1}); use "
+                f"end_line=start_line-1 to insert before start_line"
+            )
+        return s, e - s + 1, new_string
+
+    def _normalize_line_edits(self, edits: Any) -> list[tuple[int, int, str]]:
+        if not isinstance(edits, list) or not edits:
+            raise InvalidArguments("edits must be a non-empty list of line-edit objects")
+        out: list[tuple[int, int, str]] = []
+        for i, e in enumerate(edits):
+            if not isinstance(e, dict):
+                raise InvalidArguments(f"edits[{i}] must be an object with start_line/end_line/new_string")
+            out.append(self._normalize_line_edit(
+                e.get("start_line"), e.get("end_line"), e.get("new_string"), where=f"edits[{i}].",
+            ))
+        return out
+
+    def _edit_lines(
+        self,
+        path: str,
+        normalized: list[tuple[int, int, str]],
+        *,
+        expected_hash: str | None,
+        expected_mtime: int | None,
+        allow_replacement_chars: bool = False,
+    ) -> dict[str, Any]:
+        """Validate, splice (one or many edits) and commit in a single atomic write."""
+        real, rel = self._resolve(path)
+        if not real.exists():
+            raise NotFound(f"file not found: {rel}")
+        if real.is_dir():
+            raise InvalidArguments(f"path is a directory: {rel}")
+        if not allow_replacement_chars:
+            for _s, _c, new_string in normalized:
+                if new_string:
+                    self._guard_replacement_chars(new_string, where=f"new content for {rel!r}")
+
+        with self.locks.hold(real):
+            raw = real.read_bytes()
+            baseline = self._baseline_hash(real, expected_hash)
+            if baseline is not None or expected_mtime is not None:
+                self._check_conflict(raw, real, baseline, expected_mtime)
+
+            det = self._detect(raw, rel, None)
+            bom = det.bom
+            body = raw[len(bom):]
+            encode_codec = enc.python_encode_codec(det.logical, self.config.encode_codec)
+            probe = enc.decode_body(body, det.decode_codec, errors="replace")
+            eol = enc.detect_eol(probe) or self.config.default_eol
+
+            res = enc.edit_lines_multi_in_body(
+                body, decode_codec=det.decode_codec, encode_codec=encode_codec, eol=eol,
+                edits=normalized,
+            )
+            data = bom + res.new_body
+            atomic_write(real, data)
+            digest = sha256_hex(data)
+            self._mark_read(real, digest)
+
+        return {
+            "path": rel,
+            "num_edits": res.num_edits,
+            "encoding": det.logical,
+            "eol": eol,
+            "lines_removed": res.lines_removed,
+            "lines_added": res.lines_added,
+            "old_line_count": res.old_line_count,
+            "new_line_count": res.new_line_count,
+            "bytes_written": len(data),
+            "sha256": digest,
+            "mtime_ns": real.stat().st_mtime_ns,
+            "diff": self._unified_diff(rel, res.old_view_lf, res.new_view_lf),
+        }
+
     def _stage_file(
         self, raw: bytes, rel: str, file_edits: list[dict[str, Any]]
     ) -> tuple[bytes, list[tuple[dict, enc.ReplaceResult]], str, str]:

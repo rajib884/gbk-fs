@@ -101,6 +101,16 @@ def _format_search(res: dict[str, Any]) -> str:
     return f"{body}\n\n{head}" + (" (truncated)" if res.get("truncated") else "")
 
 
+def _format_line_edit(res: dict[str, Any]) -> str:
+    head = (
+        f"Edited {res['path']}: {res['num_edits']} edit(s), "
+        f"-{res['lines_removed']}/+{res['lines_added']} line(s) "
+        f"({res['old_line_count']} -> {res['new_line_count']} total), "
+        f"encoding={res['encoding']}, eol={res['eol']}. new sha256={res['sha256']}"
+    )
+    return f"{head}\n{res['diff']}" if res.get("diff") else head
+
+
 def _format_apply(res: dict[str, Any]) -> str:
     head = f"[gbk-fs apply_edits] atomic={res['atomic']} ok={res['ok']}"
     rows = []
@@ -253,6 +263,57 @@ def build_server(core: GbkFs) -> FastMCP:
                 f"eol={r['eol']}. new sha256={r['sha256']}"
             )
             return f"{head}\n{r['diff']}" if r["diff"] else head
+        except GbkFsError as e:
+            raise _err(e)
+
+    @mcp.tool()
+    def replace_lines(
+        path: Annotated[str, Field(description="Absolute or repo-relative path")],
+        start_line: Annotated[
+            int | None, Field(description="1-based first line of the range (single-edit form)")
+        ] = None,
+        end_line: Annotated[
+            int | None,
+            Field(description="1-based last line, inclusive. Set end_line = start_line - 1 to "
+                              "INSERT before start_line (use start_line = line_count+1 to append)")
+        ] = None,
+        new_string: Annotated[
+            str | None,
+            Field(description="Replacement text for the range (UTF-8; new CJK is OK). May be "
+                              "multiple lines; empty string deletes the range")
+        ] = None,
+        edits: Annotated[
+            list[dict[str, Any]] | None,
+            Field(description="Batch form: list of {start_line, end_line, new_string}. Every line "
+                              "number addresses the ORIGINAL file and the whole list is applied in "
+                              "one atomic write, so non-contiguous edits need no manual ordering. "
+                              "Edits must not overlap. Use instead of the positional args, not "
+                              "alongside them")
+        ] = None,
+        expected_hash: Annotated[
+            str | None, Field(description="sha256 from a prior read; rejects if file changed")
+        ] = None,
+        allow_replacement_chars: Annotated[
+            bool, Field(description="Permit U+FFFD in new_string; refused by default")
+        ] = False,
+    ) -> str:
+        """Edit a file by line NUMBER (replace / delete / insert), no exact-match needed.
+
+        Prefer this over edit_file when reproducing the old text byte-exactly is fragile
+        (tab/space-heavy banners, large or non-contiguous spans). Each edit is an inclusive range
+        start_line..end_line plus new_string:
+          • replace = end_line >= start_line, non-empty new_string
+          • delete  = end_line >= start_line, empty new_string
+          • insert before start_line = end_line == start_line - 1 (start_line = line_count+1 appends)
+        Edit one range positionally, or many at once via `edits` (each addressing the original
+        file's line numbers — no bottom-to-top juggling). Bytes outside the edited spans stay
+        byte-identical.
+        """
+        try:
+            return _format_line_edit(core.replace_lines(
+                path, start_line, end_line, new_string, edits=edits,
+                expected_hash=expected_hash, allow_replacement_chars=allow_replacement_chars,
+            ))
         except GbkFsError as e:
             raise _err(e)
 

@@ -24,7 +24,8 @@ on write.
 | `read_git` | Read a file's bytes from a git ref (`HEAD`, a SHA, a branch, `:0:`/index) and decode like `read_file` — recover a corrupted working file from its clean committed/staged source |
 | `write_file` | Create/overwrite; encodes to target; refuses to clobber an unread file (FR8) or to write `U+FFFD` corruption |
 | `edit_file` | Exact-match replace with byte-faithful splicing; returns a unified diff; refuses `U+FFFD` in `new_string` |
-| `apply_edits` | Many edits across files in one call; transactional (`atomic=true`) with rollback |
+| `replace_lines` | Edit by line **number** (no exact old-string): replace/delete/insert via an inclusive `start_line..end_line` range. Single edit or a non-overlapping **batch** (all addressing the original file, one atomic write) + unified diff. For tab/space-heavy banners, large spans, or several non-contiguous edits where reproducing `old_string` is fragile |
+| `apply_edits` | Many exact-string edits across files in one call; transactional (`atomic=true`) with rollback |
 | `search_content` | ripgrep-class regex search; decodes per-file before matching; UTF-8 out. Supports Unicode properties (`\p{Han}`), brace-hex (`\x{4e00}`) and explicit ranges (`[一-鿿]`) |
 | `list_files` | Glob listing (`**`, `{a,b}` supported), optional size/mtime/encoding |
 | `stat_file` | Metadata only (encoding, eol, bom, size, line_count, is_binary) |
@@ -104,6 +105,15 @@ read raw bytes ──▶ decode to a UTF-8 view (locate match) ──▶ map cha
 Only the replaced span's bytes change. The decode is used purely to find the match; the rest
 of the file is copied verbatim, so a `git diff` shows only the line you actually changed.
 
+`replace_lines` uses the **same splice**, but locates the span by line number instead of by
+matching text — handy when reproducing the old text exactly (tab/space-heavy banners, large
+multi-line spans) is fragile. One inclusive `start_line..end_line` range covers all three
+operations: replace, delete (empty `new_string`), and insert (`end_line = start_line - 1`
+inserts before `start_line`; `start_line = line_count + 1` appends). EOL, BOM and
+final-newline state are preserved, and only the affected lines are re-encoded. Pass a **batch**
+of edits in one call and every line number addresses the *original* file — applied as a single
+atomic write — so several non-contiguous edits need no bottom-to-top juggling.
+
 ## Recovering a corrupted file
 
 If a file's working-tree bytes get mangled — e.g. another editor saved a GBK file as UTF-8,
@@ -132,7 +142,7 @@ the working file "read", so it can't accidentally satisfy the unread-overwrite g
 ## Develop / test
 
 ```bash
-.venv/Scripts/python -m pytest        # 57 tests: encoding, fidelity, search, sandbox, concurrency, corruption guard, git-ref reads
+.venv/Scripts/python -m pytest        # 87 tests: encoding, fidelity, line edits, search, sandbox, concurrency, corruption guard, git-ref reads
 ```
 
 ## License

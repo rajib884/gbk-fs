@@ -18,7 +18,7 @@ from __future__ import annotations
 import codecs
 from dataclasses import dataclass
 
-from .errors import AmbiguousMatch, DecodeError, LossyEncode, MatchNotFound
+from .errors import AmbiguousMatch, DecodeError, InvalidArguments, LossyEncode, MatchNotFound
 
 # --------------------------------------------------------------------------------------
 # Codec families
@@ -385,4 +385,227 @@ def replace_in_body(
         replacements=len(matches),
         old_view_lf=normalize_to_lf(text),
         new_view_lf=normalize_to_lf(new_text),
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Line-addressed byte splice (used by replace_lines: replace / delete / insert, single or batch)
+# --------------------------------------------------------------------------------------
+
+
+def line_spans(text: str) -> list[tuple[int, int, int]]:
+    """Per-line ``(content_start, content_end, term_end)`` char offsets in ``text``.
+
+    Line boundaries follow the model's ``cat -n`` numbering: CRLF, a lone CR and a lone LF
+    each count as exactly one terminator (matching :func:`normalize_to_lf`). A trailing line
+    with no terminator is included; a final terminator does *not* create a phantom empty
+    line. The number of spans therefore equals ``read_file``'s reported ``line_count``, so a
+    1-based line number means the same thing here as it does to the model.
+    """
+    spans: list[tuple[int, int, int]] = []
+    n = len(text)
+    line_start = 0
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            spans.append((line_start, i, i + 1))
+            line_start = i + 1
+            i += 1
+        elif ch == "\r":
+            term_end = i + 2 if (i + 1 < n and text[i + 1] == "\n") else i + 1
+            spans.append((line_start, i, term_end))
+            line_start = term_end
+            i = term_end
+        else:
+            i += 1
+    if line_start < n:  # trailing line with no terminator
+        spans.append((line_start, n, n))
+    return spans
+
+
+@dataclass
+class LineEditResult:
+    new_body: bytes
+    old_view_lf: str        # full pre-edit text, LF-normalized (for diffing)
+    new_view_lf: str        # full post-edit text, LF-normalized (for diffing)
+    old_line_count: int
+    new_line_count: int
+    lines_removed: int      # existing lines the edits replaced/deleted (summed)
+    lines_added: int        # lines contributed by new_string(s) (summed)
+    num_edits: int          # how many edits were applied in this call
+
+
+def _compute_line_edit(
+    text: str,
+    spans: list[tuple[int, int, int]],
+    line_count: int,
+    text_len: int,
+    final_nl: bool,
+    eol_str: str,
+    *,
+    start_line: int,
+    count: int,
+    new_string: str,
+) -> tuple[int, int, str, int]:
+    """Resolve one line edit to ``(remove_start_char, remove_end_char, block, lines_added)``.
+
+    ``[remove_start, remove_end)`` is the half-open char span this edit overwrites in the
+    *original* text (``remove_end == remove_start`` for an insert). ``block`` is the EOL-adjusted
+    replacement text. Pure / positional; raises InvalidArguments on an out-of-range address.
+    """
+    if count < 0:
+        raise InvalidArguments("count must be >= 0")
+    if count == 0:
+        if not (1 <= start_line <= line_count + 1):
+            raise InvalidArguments(
+                f"insert position {start_line} is out of range; file has {line_count} "
+                f"line(s) (valid insert positions are 1..{line_count + 1})"
+            )
+    else:
+        end_line = start_line + count - 1
+        if start_line < 1 or end_line > line_count:
+            raise InvalidArguments(
+                f"line range {start_line}..{end_line} is out of range; file has "
+                f"{line_count} line(s)"
+            )
+
+    def content_start(line: int) -> int:
+        # 1-based; line == line_count + 1 maps to end-of-text (the append point).
+        return spans[line - 1][0] if line <= line_count else text_len
+
+    remove_start = content_start(start_line)
+    remove_end = content_start(start_line + count)
+
+    prefix = text[:remove_start]
+    suffix = text[remove_end:]
+
+    payload_lf = normalize_to_lf(new_string)
+    if payload_lf.endswith("\n"):
+        payload_lf = payload_lf[:-1]  # one trailing newline is cosmetic; lines define count
+    payload_lines = payload_lf.split("\n") if payload_lf != "" else []
+
+    if payload_lines:
+        block = eol_str.join(payload_lines)
+        # Keep a trailing terminator when content follows, or when the file ended with one.
+        if suffix or final_nl:
+            block += eol_str
+        # Appending after an unterminated final line needs a separator in front.
+        if not suffix and prefix and not prefix.endswith(("\n", "\r")):
+            block = eol_str + block
+    else:
+        block = ""
+
+    return remove_start, remove_end, block, len(payload_lines)
+
+
+def edit_lines_in_body(
+    body: bytes,
+    *,
+    decode_codec: str,
+    encode_codec: str,
+    eol: str,
+    start_line: int,
+    count: int,
+    new_string: str,
+) -> LineEditResult:
+    """Single-edit convenience wrapper over :func:`edit_lines_multi_in_body`.
+
+    ``count >= 1`` replaces lines ``start_line .. start_line+count-1`` inclusive (empty
+    ``new_string`` deletes them); ``count == 0`` inserts before ``start_line``.
+    """
+    return edit_lines_multi_in_body(
+        body, decode_codec=decode_codec, encode_codec=encode_codec, eol=eol,
+        edits=[(start_line, count, new_string)],
+    )
+
+
+def edit_lines_multi_in_body(
+    body: bytes,
+    *,
+    decode_codec: str,
+    encode_codec: str,
+    eol: str,
+    edits: list[tuple[int, int, str]],
+) -> LineEditResult:
+    """Apply several line edits to ``body`` in one byte-faithful splice.
+
+    Each edit is ``(start_line, count, new_string)`` with 1-based line numbers addressing the
+    **original** file — so callers never have to compensate for line-number drift between edits.
+    ``count >= 1`` replaces an inclusive line range (empty ``new_string`` deletes it); ``count
+    == 0`` inserts before ``start_line`` (use ``line_count + 1`` to append at EOF).
+
+    Fidelity matches :func:`replace_in_body`: line offsets are located in the decoded view, then
+    raw bytes are spliced, so every byte outside an edited span is preserved and only the
+    ``new_string``s are re-encoded. EOL convention and the file's final-newline state are kept.
+
+    Edits must not overlap (two replace/delete ranges sharing a line, or an insert landing
+    *inside* a replaced range, is rejected). Adjacency and a shared boundary are allowed; edits
+    that resolve to the same position are emitted in input order.
+
+    Raises InvalidArguments (range / overlap), LossyEncode, DecodeError.
+    """
+    if not edits:
+        raise InvalidArguments("edit_lines_multi_in_body needs at least one edit")
+
+    text, starts = char_byte_starts(body, decode_codec)
+    spans = line_spans(text)
+    line_count = len(spans)
+    text_len = len(text)
+    final_nl = has_final_newline(text)
+    eol_str = EOL_STR[eol]
+
+    # Resolve every edit to a char span + replacement block (validates ranges).
+    resolved: list[tuple[int, int, str, int, int]] = []  # rs, re, block, count, idx
+    lines_removed = 0
+    lines_added = 0
+    for idx, (start_line, count, new_string) in enumerate(edits):
+        rs, re, block, added = _compute_line_edit(
+            text, spans, line_count, text_len, final_nl, eol_str,
+            start_line=start_line, count=count, new_string=new_string,
+        )
+        resolved.append((rs, re, block, count, idx))
+        lines_removed += count
+        lines_added += added
+
+    # Detect conflicts (order-independent). Two removed (positive-width) ranges may not overlap;
+    # an insert point may not fall *strictly inside* a removed range. Sharing a boundary is fine.
+    positives = [(rs, re, idx) for rs, re, _b, count, idx in resolved if count > 0]
+    max_re = 0
+    for rs, re, idx in sorted(positives):
+        if rs < max_re:
+            raise InvalidArguments(
+                f"edit #{idx} overlaps another edit's line range; edits in one call "
+                f"must not overlap"
+            )
+        max_re = max(max_re, re)
+    for rs, _re, _b, count, idx in resolved:
+        if count == 0 and any(p < rs < q for p, q, _i in positives):
+            raise InvalidArguments(
+                f"edit #{idx} inserts inside a range removed by another edit; edits in "
+                f"one call must not overlap"
+            )
+
+    # Splice once, left-to-right, copying untouched bytes verbatim. Sorting by (rs, re, idx)
+    # keeps prev_byte monotonic and places a zero-width insert before a removal that starts at
+    # the same point (i.e. "insert before line L" precedes a replacement of line L).
+    out = bytearray()
+    prev_byte = 0
+    for rs, re, block, _count, _idx in sorted(resolved, key=lambda r: (r[0], r[1], r[4])):
+        out += body[prev_byte : starts[rs]]
+        out += encode_text(block, encode_codec)
+        prev_byte = starts[re]
+    out += body[prev_byte:]
+    out = bytes(out)
+
+    new_text = decode_body(out, decode_codec)
+    return LineEditResult(
+        new_body=out,
+        old_view_lf=normalize_to_lf(text),
+        new_view_lf=normalize_to_lf(new_text),
+        old_line_count=line_count,
+        new_line_count=len(line_spans(new_text)),
+        lines_removed=lines_removed,
+        lines_added=lines_added,
+        num_edits=len(edits),
     )
